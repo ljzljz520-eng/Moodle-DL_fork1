@@ -151,6 +151,25 @@ class SettingsPage(QWidget):
         self.domain_blacklist_input.setToolTip(self.tr('Never download files from these domains.'))
         domain_layout.addWidget(self.domain_blacklist_input)
 
+        tr_label = QLabel(
+            self.tr(
+                'Trusted Redirect Domains (one per line):\n'
+                'Cross-origin redirects from Moodle are only followed to these domains. '
+                'The Moodle token is stripped and Moodle cookies are not forwarded.'
+            )
+        )
+        domain_layout.addWidget(tr_label)
+        self.trusted_redirect_input = QTextEdit()
+        self.trusted_redirect_input.setPlaceholderText('video.example.edu')
+        self.trusted_redirect_input.setMaximumHeight(80)
+        self.trusted_redirect_input.setToolTip(
+            self.tr(
+                'Only redirects that leave the Moodle origin and target one of these domains '
+                'are followed. Leave empty to block every cross-origin redirect.'
+            )
+        )
+        domain_layout.addWidget(self.trusted_redirect_input)
+
         domain_group.setLayout(domain_layout)
         layout.addWidget(domain_group)
 
@@ -244,6 +263,8 @@ class SettingsPage(QWidget):
         self.domain_whitelist_input.setPlainText('\n'.join(whitelist) if whitelist else '')
         blacklist = self.config.get_download_domains_blacklist()
         self.domain_blacklist_input.setPlainText('\n'.join(blacklist) if blacklist else '')
+        trusted_redirects = self.config.get_trusted_redirect_domains()
+        self.trusted_redirect_input.setPlainText('\n'.join(trusted_redirects) if trusted_redirects else '')
 
     def _browse_download_path(self) -> None:
         """Open a directory chooser for the download path."""
@@ -318,6 +339,10 @@ class SettingsPage(QWidget):
         bl_text = self.domain_blacklist_input.toPlainText().strip()
         blacklist = [d.strip() for d in bl_text.splitlines() if d.strip()] if bl_text else []
         self.config.set_property('download_domains_blacklist', blacklist)
+
+        tr_text = self.trusted_redirect_input.toPlainText().strip()
+        trusted_redirects = [d.strip() for d in tr_text.splitlines() if d.strip()] if tr_text else []
+        self.config.set_property('trusted_redirect_domains', trusted_redirects)
 
         if language_changed:
             QMessageBox.information(

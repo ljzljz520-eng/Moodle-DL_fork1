@@ -25,6 +25,7 @@ import html2text
 import yt_dlp
 
 from moodle_dl.downloader.extractors import add_additional_extractors
+from moodle_dl.downloader.redirect_policy import RedirectBlockedError, RedirectPolicy, censor_url
 from moodle_dl.types import (
     Course,
     DlEvent,
@@ -36,10 +37,8 @@ from moodle_dl.types import (
 )
 from moodle_dl.utils import (
     LINK_TEMPLATES,
-    MoodleDLCookieJar,
     SslHelper,
     Timer,
-    convert_to_aiohttp_cookie_jar,
     format_bytes,
     format_seconds,
     timeconvert,
@@ -82,6 +81,14 @@ class Task:
         self.filename = PT.to_valid_name(self.file.content_filename, is_file=True)
         self.status = TaskStatus()
 
+        self.redirect_policy = RedirectPolicy(
+            moodle_url=options.moodle_url,
+            token=options.token,
+            trusted_redirect_domains=options.trusted_redirect_domains,
+            domains_whitelist=options.download_domains_whitelist,
+            domains_blacklist=options.download_domains_blacklist,
+        )
+
     @staticmethod
     def gen_path(storage_path: str, course: Course, file: File):
         "Generate the directory path where a file should be stored"
@@ -104,18 +111,6 @@ class Task:
                 storage_path, course_name, file.section_name, file.module_name, file.content_filepath
             )
         return PT.path_of_file(storage_path, course_name, file.section_name, file.content_filepath)
-
-    def add_token_to_url(self, url: str) -> str:
-        """
-        Adds the Moodle token to a URL
-        @param url: The URL to that the token should be added.
-        @return: The URL with the token.
-        """
-        url_parts = list(urlparse.urlparse(url))
-        query = dict(urlparse.parse_qsl(url_parts[4]))
-        query.update({'token': self.opts.token})
-        url_parts[4] = urlparse.urlencode(query)
-        return urlparse.urlunparse(url_parts)
 
     def create_target_file(self, target_path: str) -> str:
         """
@@ -309,9 +304,18 @@ class Task:
                 '[%d] Access time and modification time of the downloaded file could not be set', self.task_id
             )
 
-    async def get_head_infos(self, dl_url: str) -> HeadInfo:
+    async def get_head_infos(
+        self,
+        original_url: str,
+        request_url: str,
+        attach_token: bool,
+        enforce_domain_filter: bool,
+    ) -> HeadInfo:
         """
-        Do a Head request to collect some information about the URL
+        Do a Head request to collect some information about the URL.
+        The redirect policy is enforced while following the redirect chain.
+        @param original_url: The unmodified link reported by Moodle
+        @param request_url: The sanitized link that is actually requested
         @return: If download should be aborted then None; else HeadInfo
         """
         ssl_context = SslHelper.get_ssl_context(
@@ -323,34 +327,66 @@ class Task:
             resolver=aiohttp.ThreadedResolver() if sys.platform == 'win32' else aiohttp.AsyncResolver()
         )
         async with aiohttp.ClientSession(
-            connector=connector, cookie_jar=self.get_cookie_jar(), raise_for_status=True
+            connector=connector,
+            cookie_jar=self.redirect_policy.new_cookie_jar(self.opts.cookies_text),
+            raise_for_status=True,
         ) as session:
             try:
-                async with session.request("HEAD", dl_url, headers=self.RQ_HEADER, ssl=ssl_context, timeout=20) as resp:
-                    if resp.url != dl_url:
-                        if resp.history and len(resp.history) > 0:
-                            logging.debug('[%d] URL was %s time(s) redirected', self.task_id, len(resp.history))
-                        else:
-                            logging.debug('[%d] URL has changed after information retrieval', self.task_id)
+                response, chain = await self.redirect_policy.open(
+                    session,
+                    "HEAD",
+                    request_url,
+                    headers=self.RQ_HEADER,
+                    ssl=ssl_context,
+                    timeout=20,
+                    attach_token=attach_token,
+                    enforce_domain_filter=enforce_domain_filter,
+                )
+                async with response:
+                    if len(chain.history) > 1:
+                        logging.debug(
+                            '[%d] URL was redirected %s time(s)%s. History: %s',
+                            self.task_id,
+                            len(chain.history) - 1,
+                            ' (cross-origin)' if chain.crossed_origin else '',
+                            ' -> '.join(chain.history),
+                        )
+                    elif chain.final_url != original_url:
+                        logging.debug('[%d] URL has changed after information retrieval', self.task_id)
 
-                    guessed_file_name = posixpath.basename(resp.url.path)
-                    if "Content-Disposition" in resp.headers.keys():
+                    logging.debug(
+                        '[%d] Original URL: %s | Request URL: %s | Final URL: %s',
+                        self.task_id,
+                        censor_url(original_url),
+                        censor_url(chain.request_url),
+                        censor_url(chain.final_url),
+                    )
+
+                    final_parsed = urlparse.urlparse(chain.final_url)
+                    guessed_file_name = posixpath.basename(final_parsed.path)
+                    if "Content-Disposition" in response.headers.keys():
                         # Exp: Content-Disposition: attachment; filename="filename.jpg"
-                        found_names = re.findall("filename=(.+)", resp.headers["Content-Disposition"])
+                        found_names = re.findall("filename=(.+)", response.headers["Content-Disposition"])
                         if len(found_names) > 0:
                             guessed_file_name = unquote(found_names[0])
 
                     return HeadInfo(
                         # Exp: Content-Type: text/html; charset=utf-8
-                        content_type=resp.headers.get('Content-Type', 'text/html').split(';')[0],
-                        content_length=int(resp.headers.get('Content-Length', -1)),
+                        content_type=response.headers.get('Content-Type', 'text/html').split(';')[0],
+                        content_length=int(response.headers.get('Content-Length', -1)),
                         # Exp: Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT
-                        last_modified=resp.headers.get('Last-Modified', None),
-                        final_url=str(resp.url),
+                        last_modified=response.headers.get('Last-Modified', None),
+                        final_url=chain.final_url,
                         guessed_file_name=guessed_file_name,
-                        host=resp.url.host,
+                        host=final_parsed.hostname,
+                        redirect_history=chain.history,
+                        crossed_origin=chain.crossed_origin,
                     )
 
+            except RedirectBlockedError as blocked_err:
+                # e.g. a cross-origin redirect to a domain that is not explicitly trusted
+                logging.warning('[%d] Download of the external file was canceled: %s', self.task_id, blocked_err)
+                return None
             except aiohttp.InvalidURL:
                 # don't download urls like 'mailto:name@provider.com'
                 logging.debug(
@@ -378,11 +414,32 @@ class Task:
                 logging.warning('[%d] Head request for external file failed with unexpected error', self.task_id)
                 raise head_err from None
 
-    async def download_using_yt_dlp(self, dl_url: str, infos: HeadInfo, delete_if_successful: bool):
+    async def download_using_yt_dlp(
+        self,
+        original_url: str,
+        request_url: str,
+        final_url: str,
+        infos: HeadInfo,
+        delete_if_successful: bool,
+    ):
         """
+        @param original_url: The unmodified link reported by Moodle
+        @param request_url: The sanitized link (token only on same-origin Moodle paths)
+        @param final_url: The final URL after following the redirects
         @param delete_if_successful: Deletes the tmp file if download was successful
         @return: False if the page should be downloaded anyway; True if yt-dlp has processed the URL and we are done
         """
+        # yt-dlp starts at the sanitized request URL, so that e.g. LTI launches can
+        # authenticate on the Moodle origin first. The cookies it receives are scoped
+        # to the Moodle domain and the token is only present on the same-origin URL.
+        dl_url = request_url
+        logging.debug(
+            '[%d] yt-dlp received original URL: %s | request URL: %s | final URL: %s',
+            self.task_id,
+            censor_url(original_url),
+            censor_url(request_url),
+            censor_url(final_url),
+        )
         # We try to limit the filename to < 250 chars
         if self.file.content_type == 'description-url':
             filename_template = '%(title).180B (%(id).32B).%(ext)s'
@@ -457,12 +514,31 @@ class Task:
         # We want to download the URL because yt-dlp has no extractor for it
         return False
 
-    async def download_using_external_downloader(self, dl_url: str, external_dl_cmd: str, delete_if_successful: bool):
-        cmd = external_dl_cmd.replace('%U', dl_url)
+    async def download_using_external_downloader(
+        self,
+        original_url: str,
+        request_url: str,
+        final_url: str,
+        external_dl_cmd: str,
+        delete_if_successful: bool,
+    ):
+        """
+        The configured command supports the following URL placeholders:
+            %U - sanitized request URL (token only on same-origin Moodle paths) [default]
+            %O - original, unmodified link reported by Moodle
+            %F - final URL after following the redirects
+        """
+        cmd = external_dl_cmd
+        # Replace the more specific placeholders before %U, so they never get partially replaced
+        if '%O' in cmd or '%F' in cmd:
+            cmd = cmd.replace('%O', original_url).replace('%F', final_url)
+        cmd = cmd.replace('%U', request_url)
         logging.debug(
-            '[%d] Run external downloader using the following command: `%s`',
+            '[%d] Run external downloader using the following command: `%s` (original URL: %s, final URL: %s)',
             self.task_id,
             cmd,
+            censor_url(original_url),
+            censor_url(final_url),
         )
         external_dl_failed_with_error = False
         try:
@@ -494,22 +570,35 @@ class Task:
 
         self.file.saved_to = str(Path(self.destination) / self.filename)
 
-    async def external_download_url(self, add_token: bool, delete_if_successful: bool, needs_moodle_cookies: bool):
+    async def external_download_url(
+        self,
+        add_token: bool,
+        delete_if_successful: bool,
+        needs_moodle_cookies: bool,
+        enforce_domain_filter: bool = False,
+    ):
         """
         Use only for "external" shortcut/URL files.
         It tests whether a URL refers to a file, that is not an HTML web page then downloads it.
         Otherwise an attempt will be made to download it using yt-dlp.
 
-        @param add_token: Adds the ws-token to the url
+        @param add_token: Adds the ws-token to the url (only on same-origin Moodle paths)
         @param delete_if_successful: Deletes the tmp file if download was successful
         @param needs_moodle_cookies: For this URL moodle cookies are required
+        @param enforce_domain_filter: Apply the external domain white/black list to cross-origin redirects
         In case of an failure an exception will be raised
         """
-        url_to_download = self.file.content_fileurl
-        logging.debug('[%d] Try to download external file %s', self.task_id, url_to_download)
-
-        if add_token:
-            url_to_download = self.add_token_to_url(url_to_download)
+        # Keep the original link, the sanitized request link and the final URL apart:
+        # original_url is never modified, request_url only carries a token on same-origin
+        # Moodle install paths, and final_url is determined by following the redirect chain.
+        original_url = self.file.content_fileurl
+        request_url = self.redirect_policy.sanitize_url(original_url, add_token)
+        logging.debug(
+            '[%d] Try to download external file %s (request URL: %s)',
+            self.task_id,
+            censor_url(original_url),
+            censor_url(request_url),
+        )
 
         if delete_if_successful:
             # If temporary file is not needed delete it as soon as possible
@@ -523,22 +612,34 @@ class Task:
                 'Moodle cookies are missing. Set a private token so that moodle-dl can obtain moodle cookies'
             )
 
-        infos = await self.get_head_infos(url_to_download)
+        infos = await self.get_head_infos(
+            original_url,
+            request_url,
+            attach_token=add_token,
+            enforce_domain_filter=enforce_domain_filter,
+        )
         if infos is None:
-            # Head request failed but we declare it as success (because URL is broken)
+            # Head request failed but we declare it as success (because URL is broken
+            # or a redirect was blocked by the security policy)
             return
+
+        final_url = infos.final_url
 
         external_dl_cmd = self.opts.external_file_downloaders.get(infos.host, "")
         if infos.is_html and external_dl_cmd != "":
             await self.download_using_external_downloader(
-                dl_url=url_to_download,
+                original_url=original_url,
+                request_url=request_url,
+                final_url=final_url,
                 external_dl_cmd=external_dl_cmd,
                 delete_if_successful=delete_if_successful,
             )
             return
-        if infos.is_html and not self.is_blocked_for_yt_dlp(url_to_download):
+        if infos.is_html and not self.is_blocked_for_yt_dlp(request_url):
             yt_dlp_processed = await self.download_using_yt_dlp(
-                dl_url=url_to_download,
+                original_url=original_url,
+                request_url=request_url,
+                final_url=final_url,
                 infos=infos,
                 delete_if_successful=delete_if_successful,
             )
@@ -561,7 +662,12 @@ class Task:
 
         self.set_path(True)
 
-        await self.download_url(url_to_download, self.file.saved_to)
+        await self.download_url(
+            request_url,
+            self.file.saved_to,
+            attach_token=add_token,
+            enforce_domain_filter=enforce_domain_filter,
+        )
 
     def is_filtered_external_domain(self):
         """
@@ -736,27 +842,55 @@ class Task:
                 await self.create_html_file()
 
             elif self.file.module_modname.startswith('index_mod'):
-                await self.external_download_url(add_token=True, delete_if_successful=True, needs_moodle_cookies=False)
+                # Token is required, cookies are only sent on same-origin requests
+                await self.external_download_url(
+                    add_token=True,
+                    delete_if_successful=True,
+                    needs_moodle_cookies=False,
+                    enforce_domain_filter=False,
+                )
 
             elif self.file.module_modname.startswith('cookie_mod'):
-                await self.external_download_url(add_token=False, delete_if_successful=True, needs_moodle_cookies=True)
+                # No token, but Moodle cookies are needed for the same-origin launch
+                await self.external_download_url(
+                    add_token=False,
+                    delete_if_successful=True,
+                    needs_moodle_cookies=True,
+                    enforce_domain_filter=False,
+                )
 
             elif self.file.module_modname.startswith('url') and not self.file.content_fileurl.startswith('data:'):
                 # Create a shortcut and maybe downloading it
                 await self.create_shortcut()
                 if self.opts.download_linked_files and not self.is_filtered_external_domain():
                     await self.external_download_url(
-                        add_token=False, delete_if_successful=False, needs_moodle_cookies=False
+                        add_token=False,
+                        delete_if_successful=False,
+                        needs_moodle_cookies=False,
+                        # Linked external files additionally respect the domain white/black list
+                        enforce_domain_filter=True,
                     )
 
             elif self.file.content_fileurl.startswith('data:'):
                 await self.create_data_url_file()
 
             else:
-                url_to_download = self.file.content_fileurl
-                logging.debug('[%d] Downloading %s', self.task_id, url_to_download)
-                url_to_download = self.add_token_to_url(self.file.content_fileurl)
-                await self.download_url(url_to_download, self.file.saved_to)
+                # Normal Moodle plugin files: the token is attached, but only on the
+                # same-origin Moodle installation path. Same-origin plugin file behavior
+                # (token + cookies) is fully preserved.
+                request_url = self.redirect_policy.sanitize_url(self.file.content_fileurl, True)
+                logging.debug(
+                    '[%d] Downloading %s (request URL: %s)',
+                    self.task_id,
+                    censor_url(self.file.content_fileurl),
+                    censor_url(request_url),
+                )
+                await self.download_url(
+                    request_url,
+                    self.file.saved_to,
+                    attach_token=True,
+                    enforce_domain_filter=False,
+                )
 
             logging.debug('[%d] Download finished', self.task_id)
             self.report_success()
@@ -790,20 +924,21 @@ class Task:
 
         return False
 
-    def get_cookie_jar(self) -> aiohttp.CookieJar:
-        # TODO: Since we currently do not modify the cookieJar we could just use a deep copied instance.
-        if self.opts.cookies_text is not None:
-            cookie_jar = MoodleDLCookieJar(StringIO(self.opts.cookies_text))
-            cookie_jar.load(ignore_discard=True, ignore_expires=True)
-            return convert_to_aiohttp_cookie_jar(cookie_jar)
-        return None
-
-    async def check_range_download_opt(self, url, session):
+    async def check_range_download_opt(self, url, session, ssl_context, attach_token, enforce_domain_filter):
         try:
             headers = self.RQ_HEADER.copy()
             headers['Range'] = 'bytes=0-4'
-            resp = await session.request("GET", url, headers=headers)
-            return resp.headers.get('Content-Range') is not None and resp.status == 206
+            resp, _chain = await self.redirect_policy.open(
+                session,
+                "GET",
+                url,
+                headers=headers,
+                ssl=ssl_context,
+                attach_token=attach_token,
+                enforce_domain_filter=enforce_domain_filter,
+            )
+            async with resp:
+                return resp.headers.get('Content-Range') is not None and resp.status == 206
         except Exception as err:
             logging.debug("Failed to check if download can be continued on fail: %s", err)
         return False
@@ -827,7 +962,14 @@ class Task:
                     self.status.external_total_size = content_length
                 self.callback(DlEvent.TOTAL_SIZE, self, content_length=content_length)
 
-    async def download_url(self, dl_url: str, dest_path: str, timeout: int = None):
+    async def download_url(
+        self,
+        dl_url: str,
+        dest_path: str,
+        timeout: int = None,
+        attach_token: bool = True,
+        enforce_domain_filter: bool = False,
+    ):
         total_bytes_received = 0
         done_tries = 0
         can_continue_on_fail = False
@@ -843,7 +985,9 @@ class Task:
                 resolver=aiohttp.ThreadedResolver() if sys.platform == 'win32' else aiohttp.AsyncResolver()
             )
             async with aiohttp.ClientSession(
-                connector=connector, cookie_jar=self.get_cookie_jar(), raise_for_status=True
+                connector=connector,
+                cookie_jar=self.redirect_policy.new_cookie_jar(self.opts.cookies_text),
+                raise_for_status=True,
             ) as session:
                 while done_tries < self.MAX_DL_RETRIES:
                     try:
@@ -860,12 +1004,30 @@ class Task:
                         elif not can_continue_on_fail and 'Range' in headers:
                             del headers['Range']
 
-                        async with session.request(
-                            "GET", dl_url, headers=headers, ssl=ssl_context, timeout=timeout
-                        ) as resp:
+                        # Redirects are followed manually by the policy so that the
+                        # token is stripped and Moodle cookies are withheld after a
+                        # cross-origin redirect.
+                        resp, chain = await self.redirect_policy.open(
+                            session,
+                            "GET",
+                            dl_url,
+                            headers=headers,
+                            ssl=ssl_context,
+                            timeout=timeout,
+                            attach_token=attach_token,
+                            enforce_domain_filter=enforce_domain_filter,
+                        )
+                        async with resp:
                             content_length = int(resp.headers.get("Content-Length", 0))
                             self.report_content_length(content_length)
                             content_range = resp.headers.get("Content-Range")  # Exp: bytes 200-1000/67589
+
+                            if chain.crossed_origin:
+                                logging.debug(
+                                    '[%d] Downloaded URL crossed the Moodle origin during redirects: %s',
+                                    self.task_id,
+                                    ' -> '.join(chain.history),
+                                )
 
                             if resp.status not in [200, 206]:
                                 logging.debug('[%d] Warning got status %s', self.task_id, resp.status)
@@ -904,7 +1066,13 @@ class Task:
 
                     except (aiohttp.ClientError, OSError, ValueError, ContentRangeError) as err:
                         if done_tries == 0:
-                            can_continue_on_fail = await self.check_range_download_opt(dl_url, session)
+                            can_continue_on_fail = await self.check_range_download_opt(
+                                dl_url,
+                                session,
+                                ssl_context,
+                                attach_token,
+                                enforce_domain_filter,
+                            )
 
                         done_tries += 1
                         if (

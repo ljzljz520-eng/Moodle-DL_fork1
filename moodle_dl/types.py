@@ -335,6 +335,7 @@ class DownloadOptions:
     download_linked_files: bool
     download_domains_whitelist: List
     download_domains_blacklist: List
+    trusted_redirect_domains: List
     cookies_text: str
     yt_dlp_options: Dict
     video_passwords: Dict
@@ -342,6 +343,7 @@ class DownloadOptions:
     restricted_filenames: bool
     write_links: Dict
     download_path: str
+    moodle_url: 'MoodleURL'
     global_opts: MoodleDlOpts
 
 
@@ -354,6 +356,8 @@ class HeadInfo:
     final_url: str
     guessed_file_name: str
     host: str
+    redirect_history: List[str] = field(default_factory=list)
+    crossed_origin: bool = False
 
     def __post_init__(self):
         if self.content_type in ('text/html', 'text/plain'):

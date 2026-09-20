@@ -196,6 +196,10 @@ class ConfigHelper:
         # return a list of black listed domains that should not be downloaded
         return self.get_property_or('download_domains_blacklist', [])
 
+    def get_trusted_redirect_domains(self) -> List:
+        # return a list of domains a cross-origin redirect is allowed to follow
+        return self.get_property_or('trusted_redirect_domains', [])
+
     def get_cookies_text(self) -> str:
         # return the text to the cookies file, if it exists
         cookies_path = PT.get_cookies_path(self.get_misc_files_path())
@@ -258,6 +262,7 @@ class ConfigHelper:
             download_linked_files=self.get_download_linked_files(),
             download_domains_whitelist=self.get_download_domains_whitelist(),
             download_domains_blacklist=self.get_download_domains_blacklist(),
+            trusted_redirect_domains=self.get_trusted_redirect_domains(),
             cookies_text=self.get_cookies_text(),
             yt_dlp_options=self.get_yt_dlp_options(),
             video_passwords=self.get_video_passwords(),
@@ -265,6 +270,7 @@ class ConfigHelper:
             restricted_filenames=self.get_restricted_filenames(),
             write_links=self.get_write_links(),
             download_path=self.get_download_path(),
+            moodle_url=self.get_moodle_URL(),
             global_opts=opts,
         )
 
